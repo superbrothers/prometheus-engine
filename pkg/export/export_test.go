@@ -17,12 +17,21 @@ package export
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"testing"
+	"time"
 
+	monitoring "cloud.google.com/go/monitoring/apiv3/v2"
 	gax "github.com/googleapis/gax-go/v2"
+	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/tsdb/record"
+	"google.golang.org/api/option"
 	monitoredres_pb "google.golang.org/genproto/googleapis/api/monitoredres"
 	monitoring_pb "google.golang.org/genproto/googleapis/monitoring/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/test/bufconn"
+	empty_pb "google.golang.org/protobuf/types/known/emptypb"
 )
 
 func TestBatchAdd(t *testing.T) {
@@ -113,5 +122,84 @@ func TestBatchFillFromShardsAndSend(t *testing.T) {
 		if s.pending {
 			t.Fatalf("shard unexpectedtly pending after send")
 		}
+	}
+}
+
+func createBatch(s string) []record.RefSample {
+	batch := []record.RefSample{}
+	for i := 1; i < 10; i++ {
+		lset := labels.Labels{
+			{Name: "project_id", Value: s + fmt.Sprint(i)},
+			{Name: "location", Value: "nyc"}}
+		s := record.RefSample{
+			Ref: lset.Hash(),
+			T:   int64(i),
+			V:   float64(i),
+		}
+		batch = append(batch, s)
+	}
+	return batch
+}
+
+type testMetricService struct {
+	monitoring_pb.MetricServiceServer // Inherit all interface methods
+	TimeSeries                        []monitoring_pb.TimeSeries
+}
+
+func (srv *testMetricService) CreateTimeSeries(ctx context.Context, req *monitoring_pb.CreateTimeSeriesRequest) (*empty_pb.Empty, error) {
+	for _, ts := range req.TimeSeries {
+		srv.TimeSeries = append(srv.TimeSeries, *ts)
+	}
+	return &empty_pb.Empty{}, nil
+}
+
+func TestExport(t *testing.T) {
+	srv := grpc.NewServer()
+	listener := bufconn.Listen(1e6)
+
+	metricServer := &testMetricService{}
+	monitoring_pb.RegisterMetricServiceServer(srv, metricServer)
+
+	go func() { srv.Serve(listener) }()
+	defer srv.Stop()
+	ctx := context.Background()
+	bufDialer := func(context.Context, string) (net.Conn, error) {
+		return listener.Dial()
+	}
+	metricClient, err := monitoring.NewMetricClient(ctx,
+		option.WithoutAuthentication(),
+		option.WithGRPCDialOption(grpc.WithInsecure()),
+		option.WithGRPCDialOption(grpc.WithContextDialer(bufDialer)),
+	)
+	if err != nil {
+		t.Fatalf("creating metric client failed: %s", err)
+	}
+
+	e, err := New(nil, nil, ExporterOpts{})
+	if err != nil {
+		t.Fatalf("Creating Exporter failed: %s", err)
+	}
+	e.metricClient = metricClient
+	e.SetLabelsByIDFunc(func(i uint64) labels.Labels {
+		return labels.Labels{
+			{Name: "project_id", Value: "p" + fmt.Sprint(i)},
+			{Name: "location", Value: "nyc"}}
+	})
+
+	exportCtx, cancelExport := context.WithCancel(context.Background())
+	go func() { e.Run(exportCtx) }()
+
+	successfulBatch := createBatch("successful-batch")
+	e.Export(gaugeMetadata, createBatch("successful-batch"))
+
+	cancelExport()
+	// Delay to allow timeseries to be sent.
+	timer := time.NewTimer(1 * time.Second)
+	<-timer.C
+	// This batch will be rejected by exporter.
+	e.Export(gaugeMetadata, createBatch("reject-batch"))
+	// Only the first batch should have been sent.
+	if len(metricServer.TimeSeries) != len(successfulBatch) {
+		t.Fatalf("Export didn't send all TimeSeries after shutdown. (want=%d, got=%d)", len(successfulBatch), len(metricServer.TimeSeries))
 	}
 }
