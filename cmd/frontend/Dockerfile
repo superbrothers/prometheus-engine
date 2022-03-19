@@ -1,8 +1,8 @@
-
-FROM golang:1.17-buster AS buildbase
+# syntax = docker/dockerfile:1
+FROM --platform=${BUILDPLATFORM} golang:1.17-buster AS buildbase
 
 # Compile the UI assets.
-FROM launcher.gcr.io/google/nodejs as assets
+FROM --platform=${BUILDPLATFORM} launcher.gcr.io/google/nodejs as assets
 # To build the UI we need a recent node version and the go toolchain.
 RUN install_node v17.9.0
 COPY --from=buildbase /usr/local/go /usr/local/
@@ -20,8 +20,10 @@ COPY --from=assets /app/pkg/ui/static pkg/ui/static
 FROM buildbase AS appbase
 WORKDIR /app
 COPY --from=assets /app ./
-RUN CGO_ENABLED=0 go build -tags builtinassets -mod=vendor -o frontend ./cmd/frontend/*.go
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -tags builtinassets -mod=vendor -o frontend ./cmd/frontend/*.go
 
-FROM gcr.io/distroless/static:latest
+FROM --platform=${BUILDPLATFORM} gcr.io/distroless/static:latest
 COPY --from=appbase /app/frontend /bin/frontend
 ENTRYPOINT ["/bin/frontend"]
